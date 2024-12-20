@@ -54,6 +54,7 @@ check_resolver() {
 export -f check_resolver
 export TEST_DOMAIN OUTPUT_FILE
 
-cat "$RESOLVERS_FILE" | grep -v '^#' | grep -v '^$' | xargs -n 1 -P "$THREADS" -I {} bash -c 'check_resolver "{}"'
+# Filter comment (starting with #) and empty lines and do xargs
+grep -v '^\(#\|$\)' "$RESOLVERS_FILE" | xargs -n 1 -P "$THREADS" bash -c 'check_resolver "$0"' 
 
 echo "Testing complete. Working resolvers saved to '$OUTPUT_FILE'."
