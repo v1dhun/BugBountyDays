@@ -54,8 +54,6 @@ func (d *DefaultOSDetector) DetectOS(ttl int) string {
 		return "Linux/Unix"
 	case ttl >= 255:
 		return "Cisco/Network Device"
-	case ttl >= 32 && ttl < 33:
-		return "MacOS"
 	default:
 		return "Unknown OS"
 	}
