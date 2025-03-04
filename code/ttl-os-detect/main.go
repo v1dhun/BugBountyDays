@@ -157,13 +157,32 @@ func (s *IPScanner) sendICMPEcho(target string) (ScanResult, error) {
 	}, nil
 }
 
-// scanTargets concurrently scans multiple IP targets
-func (s *IPScanner) scanTargets(targets []string) []ScanResult {
+// streamResults writes results as they are received
+func (s *IPScanner) streamResults(targets []string) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	var wg sync.WaitGroup
 	results := make(chan ScanResult, len(targets))
 	semaphore := make(chan struct{}, s.config.MaxConcurrency)
+
+	// Prepare file or stdout for streaming
+	var file *os.File
+	var err error
+	if s.config.OutputFile != "" {
+		file, err = os.Create(s.config.OutputFile)
+		if err != nil {
+			return fmt.Errorf("failed to create output file: %v", err)
+		}
+		defer file.Close()
+
+		// Write opening bracket for JSON array
+		if _, err := file.Write([]byte("[\n")); err != nil {
+			return fmt.Errorf("failed to write opening bracket: %v", err)
+		}
+	}
+
+	// Track first result to handle comma placement
+	isFirstResult := true
 
 	for _, target := range targets {
 		wg.Add(1)
@@ -186,35 +205,45 @@ func (s *IPScanner) scanTargets(targets []string) []ScanResult {
 		}(target)
 	}
 
-	wg.Wait()
-	close(results)
-	close(semaphore)
+	// Goroutine to handle result writing
+	go func() {
+		wg.Wait()
+		close(results)
+		close(semaphore)
+	}()
 
-	var scanResults []ScanResult
+	// Process results as they come in
 	for result := range results {
-		scanResults = append(scanResults, result)
-	}
-
-	return scanResults
-}
-
-// outputResults writes scan results to JSON file or stdout
-func (s *IPScanner) outputResults(results []ScanResult) error {
-	var output []byte
-	var err error
-
-	output, err = json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal results: %v", err)
-	}
-
-	if s.config.OutputFile != "" {
-		if err := os.WriteFile(s.config.OutputFile, output, 0644); err != nil {
-			return fmt.Errorf("failed to write output file: %v", err)
+		// Convert result to JSON
+		jsonResult, err := json.Marshal(result)
+		if err != nil {
+			s.logger.Printf("Error marshaling result: %v", err)
+			continue
 		}
-		s.logger.Printf("Results written to %s", s.config.OutputFile)
-	} else {
-		fmt.Println(string(output))
+
+		if s.config.OutputFile != "" {
+			// Write with comma handling
+			if !isFirstResult {
+				if _, err := file.Write([]byte(",\n")); err != nil {
+					s.logger.Printf("Error writing comma: %v", err)
+				}
+			}
+			if _, err := file.Write(jsonResult); err != nil {
+				s.logger.Printf("Error writing result: %v", err)
+			}
+			file.Sync() // Ensure immediate write
+			isFirstResult = false
+		} else {
+			// Print to stdout
+			fmt.Println(string(jsonResult))
+		}
+	}
+
+	// Close JSON array if writing to file
+	if s.config.OutputFile != "" {
+		if _, err := file.Write([]byte("\n]")); err != nil {
+			return fmt.Errorf("failed to write closing bracket: %v", err)
+		}
 	}
 
 	return nil
@@ -325,9 +354,7 @@ func main() {
 		log.Fatalf("Error resolving targets: %v", err)
 	}
 
-	results := scanner.scanTargets(targets)
-
-	if err := scanner.outputResults(results); err != nil {
-		log.Fatalf("Error outputting results: %v", err)
+	if err := scanner.streamResults(targets); err != nil {
+		log.Fatalf("Error scanning targets: %v", err)
 	}
 }
