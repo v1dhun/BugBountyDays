@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,22 +20,23 @@ import (
 
 // Config holds the application configuration
 type Config struct {
-	Targets       []string
-	Timeout       time.Duration
+	Timeout        time.Duration
 	MaxConcurrency int
-	OutputFile    string
+	OutputFile     string
+	BufferSize     int
 }
 
 // ScanResult stores JSON output for each scanned IP
 type ScanResult struct {
-	IP         string    `json:"ip"`
-	TTL        int       `json:"ttl,omitempty"`
-	OS         string    `json:"os,omitempty"`
-	Success    bool      `json:"success"`
-	ErrorMsg   string    `json:"error,omitempty"`
-	ScanTime   time.Time `json:"scan_time"`
-	Hostname   string    `json:"hostname,omitempty"`
-	RTTms      float64   `json:"rtt_ms,omitempty"`
+	IP       string    `json:"ip"`
+	Domain   string    `json:"domain,omitempty"`
+	TTL      int       `json:"ttl,omitempty"`
+	OS       string    `json:"os,omitempty"`
+	Success  bool      `json:"success"`
+	ErrorMsg string    `json:"error,omitempty"`
+	ScanTime time.Time `json:"scan_time"`
+	Hostname string    `json:"hostname,omitempty"`
+	RTTms    float64   `json:"rtt_ms,omitempty"`
 }
 
 // OSDetector provides an interface for OS detection strategies
@@ -71,12 +73,12 @@ func NewIPScanner(config *Config) *IPScanner {
 	return &IPScanner{
 		config:     config,
 		osDetector: &DefaultOSDetector{},
-		logger:     log.New(os.Stdout, "IPScanner: ", log.Ldate|log.Ltime|log.Lshortfile),
+		logger:     log.New(os.Stdout, "IPScanner: ", log.Ldate|log.Ltime),
 	}
 }
 
 // sendICMPEcho sends an ICMP Echo Request and returns TTL and other details
-func (s *IPScanner) sendICMPEcho(target string) (ScanResult, error) {
+func (s *IPScanner) sendICMPEcho(target string, originalInput string) (ScanResult, error) {
 	start := time.Now()
 	var proto string
 	ip := net.ParseIP(target)
@@ -126,7 +128,10 @@ func (s *IPScanner) sendICMPEcho(target string) (ScanResult, error) {
 
 	// Read ICMP Echo Reply
 	reply := make([]byte, 512)
-	conn.SetReadDeadline(time.Now().Add(s.config.Timeout))
+	if err := conn.SetReadDeadline(time.Now().Add(s.config.Timeout)); err != nil {
+		return ScanResult{}, err
+	}
+
 	n, err := conn.Read(reply)
 	if err != nil {
 		return ScanResult{}, err
@@ -146,8 +151,15 @@ func (s *IPScanner) sendICMPEcho(target string) (ScanResult, error) {
 		hostname = hostnames[0]
 	}
 
+	// Determine if original input was domain
+	domain := ""
+	if originalInput != target {
+		domain = originalInput
+	}
+
 	return ScanResult{
 		IP:       target,
+		Domain:   domain,
 		TTL:      ttl,
 		OS:       s.osDetector.DetectOS(ttl),
 		Success:  true,
@@ -157,147 +169,224 @@ func (s *IPScanner) sendICMPEcho(target string) (ScanResult, error) {
 	}, nil
 }
 
-// streamResults writes results as they are received
-func (s *IPScanner) streamResults(targets []string) error {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+// streamScanner processes targets and writes results to the output
+func (s *IPScanner) streamScanner(targetChan <-chan targetInfo, wg *sync.WaitGroup, resultsChan chan<- ScanResult) {
+	defer wg.Done()
 
-	var wg sync.WaitGroup
-	results := make(chan ScanResult, len(targets))
-	semaphore := make(chan struct{}, s.config.MaxConcurrency)
+	for target := range targetChan {
+		result, err := s.sendICMPEcho(target.IP, target.Original)
+		if err != nil {
+			result = ScanResult{
+				IP:       target.IP,
+				Domain:   target.Original,
+				Success:  false,
+				ErrorMsg: err.Error(),
+				ScanTime: time.Now(),
+			}
+		}
+		resultsChan <- result
+	}
+}
 
-	// Prepare file or stdout for streaming
+// ResultWriter handles writing scan results to output
+type ResultWriter struct {
+	writer      *bufio.Writer
+	file        *os.File
+	isFirstItem bool
+	mu          sync.Mutex
+}
+
+// NewResultWriter creates a new result writer
+func NewResultWriter(outputPath string) (*ResultWriter, error) {
 	var file *os.File
 	var err error
-	if s.config.OutputFile != "" {
-		file, err = os.Create(s.config.OutputFile)
-		if err != nil {
-			return fmt.Errorf("failed to create output file: %v", err)
-		}
-		defer file.Close()
 
-		// Write opening bracket for JSON array
-		if _, err := file.Write([]byte("[\n")); err != nil {
-			return fmt.Errorf("failed to write opening bracket: %v", err)
+	if outputPath == "" {
+		file = os.Stdout
+	} else {
+		file, err = os.Create(outputPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create output file: %v", err)
 		}
 	}
 
-	// Track first result to handle comma placement
-	isFirstResult := true
+	writer := bufio.NewWriterSize(file, 64*1024) // 64KB buffer
 
-	for _, target := range targets {
-		wg.Add(1)
-		semaphore <- struct{}{}
+	if outputPath != "" {
+		if _, err := writer.WriteString("[\n"); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to write opening bracket: %v", err)
+		}
+		if err := writer.Flush(); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to flush writer: %v", err)
+		}
+	}
 
-		go func(ip string) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
+	return &ResultWriter{
+		writer:      writer,
+		file:        file,
+		isFirstItem: true,
+	}, nil
+}
 
-			result, err := s.sendICMPEcho(ip)
-			if err != nil {
-				result = ScanResult{
-					IP:       ip,
-					Success:  false,
-					ErrorMsg: err.Error(),
-					ScanTime: time.Now(),
-				}
+// WriteResult writes a scan result to the output
+func (rw *ResultWriter) WriteResult(result ScanResult) error {
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("error marshaling result: %v", err)
+	}
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if rw.file != os.Stdout {
+		if !rw.isFirstItem {
+			if _, err := rw.writer.WriteString(",\n"); err != nil {
+				return err
 			}
-			results <- result
-		}(target)
+		}
+		rw.isFirstItem = false
 	}
 
-	// Goroutine to handle result writing
-	go func() {
-		wg.Wait()
-		close(results)
-		close(semaphore)
-	}()
+	if rw.file == os.Stdout {
+		if _, err := rw.writer.Write(jsonBytes); err != nil {
+			return err
+		}
+		if _, err := rw.writer.WriteString("\n"); err != nil {
+			return err
+		}
+	} else {
+		if _, err := rw.writer.Write(jsonBytes); err != nil {
+			return err
+		}
+	}
 
-	// Process results as they come in
-	for result := range results {
-		// Convert result to JSON
-		jsonResult, err := json.Marshal(result)
-		if err != nil {
-			s.logger.Printf("Error marshaling result: %v", err)
+	return rw.writer.Flush()
+}
+
+// Close finalizes and closes the output
+func (rw *ResultWriter) Close() error {
+	if rw.file != os.Stdout {
+		if _, err := rw.writer.WriteString("\n]"); err != nil {
+			return err
+		}
+		if err := rw.writer.Flush(); err != nil {
+			return err
+		}
+		return rw.file.Close()
+	}
+	return nil
+}
+
+// targetInfo stores a target IP and its original input
+type targetInfo struct {
+	IP       string
+	Original string
+}
+
+// processArgs processes command line arguments and files
+func (s *IPScanner) processArgs(args []string, targetChan chan<- targetInfo) error {
+	for _, arg := range args {
+		// CIDR subnet handling
+		if _, _, err := net.ParseCIDR(arg); err == nil {
+			if err := s.processSubnet(arg, targetChan); err != nil {
+				s.logger.Printf("Error processing subnet %s: %v", arg, err)
+			}
 			continue
 		}
 
-		if s.config.OutputFile != "" {
-			// Write with comma handling
-			if !isFirstResult {
-				if _, err := file.Write([]byte(",\n")); err != nil {
-					s.logger.Printf("Error writing comma: %v", err)
-				}
+		// File handling
+		if stat, err := os.Stat(arg); err == nil && !stat.IsDir() {
+			if err := s.processFile(arg, targetChan); err != nil {
+				s.logger.Printf("Error processing file %s: %v", arg, err)
 			}
-			if _, err := file.Write(jsonResult); err != nil {
-				s.logger.Printf("Error writing result: %v", err)
-			}
-			file.Sync() // Ensure immediate write
-			isFirstResult = false
-		} else {
-			// Print to stdout
-			fmt.Println(string(jsonResult))
+			continue
 		}
-	}
 
-	// Close JSON array if writing to file
-	if s.config.OutputFile != "" {
-		if _, err := file.Write([]byte("\n]")); err != nil {
-			return fmt.Errorf("failed to write closing bracket: %v", err)
+		// Domain handling
+		if isDomain(arg) {
+			ip, err := s.resolveDomain(arg)
+			if err != nil {
+				s.logger.Printf("Error resolving domain %s: %v", arg, err)
+				continue
+			}
+			targetChan <- targetInfo{IP: ip, Original: arg}
+			continue
 		}
+
+		// IP handling
+		if net.ParseIP(arg) != nil {
+			targetChan <- targetInfo{IP: arg, Original: arg}
+			continue
+		}
+
+		s.logger.Printf("Skipping invalid target: %s", arg)
 	}
 
 	return nil
 }
 
-// resolveTargets converts various input types to IP list
-func (s *IPScanner) resolveTargets(args []string) ([]string, error) {
-	var targets []string
+// processFile streams a file of targets line by line
+func (s *IPScanner) processFile(filename string, targetChan chan<- targetInfo) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
 
-	for _, arg := range args {
-		// Subnet handling
-		if _, _, err := net.ParseCIDR(arg); err == nil {
-			ips, err := expandSubnet(arg)
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, s.config.BufferSize)
+	scanner.Buffer(buf, s.config.BufferSize)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if isDomain(line) {
+			ip, err := s.resolveDomain(line)
 			if err != nil {
-				s.logger.Printf("Error expanding subnet %s: %v", arg, err)
+				s.logger.Printf("Error resolving domain %s: %v", line, err)
 				continue
 			}
-			targets = append(targets, ips...)
-		} else if stat, err := os.Stat(arg); err == nil && !stat.IsDir() {
-			// File handling
-			ips, err := readIPList(arg)
-			if err != nil {
-				s.logger.Printf("Error reading file %s: %v", arg, err)
-				continue
+			targetChan <- targetInfo{IP: ip, Original: line}
+		} else if net.ParseIP(line) != nil {
+			targetChan <- targetInfo{IP: line, Original: line}
+		} else if _, _, err := net.ParseCIDR(line); err == nil {
+			if err := s.processSubnet(line, targetChan); err != nil {
+				s.logger.Printf("Error processing subnet %s: %v", line, err)
 			}
-			targets = append(targets, ips...)
 		} else {
-			// Single IP handling
-			if net.ParseIP(arg) != nil {
-				targets = append(targets, arg)
-			}
+			s.logger.Printf("Skipping invalid target in file: %s", line)
 		}
 	}
 
-	return targets, nil
+	return scanner.Err()
 }
 
-// expandSubnet converts a subnet CIDR (e.g., "192.168.1.0/24") into individual IPs
-func expandSubnet(subnet string) ([]string, error) {
-	ip, ipNet, err := net.ParseCIDR(subnet)
+// processSubnet processes a CIDR subnet
+func (s *IPScanner) processSubnet(cidr string, targetChan chan<- targetInfo) error {
+	ip, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	var ips []string
-	for ip := ip.Mask(ipNet.Mask); ipNet.Contains(ip); inc(ip) {
-		ips = append(ips, ip.String())
+	// Make a copy of the IP to avoid modifying the original
+	for ip := copyIP(ip.Mask(ipNet.Mask)); ipNet.Contains(ip); inc(ip) {
+		ipStr := ip.String()
+		targetChan <- targetInfo{IP: ipStr, Original: ipStr}
 	}
 
-	// Remove network and broadcast addresses
-	if len(ips) > 2 {
-		ips = ips[1 : len(ips)-1]
-	}
-	return ips, nil
+	return nil
+}
+
+// copyIP creates a copy of an IP address
+func copyIP(ip net.IP) net.IP {
+	dup := make(net.IP, len(ip))
+	copy(dup, ip)
+	return dup
 }
 
 // inc increments an IP address
@@ -310,27 +399,76 @@ func inc(ip net.IP) {
 	}
 }
 
-// readIPList loads IPs from a file
-func readIPList(filename string) ([]string, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	lines := string(data)
-	return splitLines(lines), nil
+// isDomain checks if a string is likely a domain name
+func isDomain(s string) bool {
+	return strings.Contains(s, ".") && net.ParseIP(s) == nil && !strings.Contains(s, "/")
 }
 
-// splitLines removes empty lines & trims spaces
-func splitLines(input string) []string {
-	var result []string
-	for _, line := range strings.Split(input, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" {
-			result = append(result, trimmed)
+// resolveDomain converts a domain to an IP address
+func (s *IPScanner) resolveDomain(domain string) (string, error) {
+	ips, err := net.LookupIP(domain)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve domain %s: %v", domain, err)
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("no IP addresses found for domain %s", domain)
+	}
+
+	// Prefer IPv4 addresses
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.String(), nil
 		}
 	}
-	return result
+
+	// Fall back to first IP of any type
+	return ips[0].String(), nil
+}
+
+// Run executes the scanning process
+func (s *IPScanner) Run(args []string) error {
+	// Set up channels
+	targetChan := make(chan targetInfo, 1000)
+	resultsChan := make(chan ScanResult, 1000)
+
+	// Create result writer
+	resultWriter, err := NewResultWriter(s.config.OutputFile)
+	if err != nil {
+		return err
+	}
+	defer resultWriter.Close()
+
+	// Start worker goroutines
+	var scanWg sync.WaitGroup
+	for i := 0; i < s.config.MaxConcurrency; i++ {
+		scanWg.Add(1)
+		go s.streamScanner(targetChan, &scanWg, resultsChan)
+	}
+
+	// Process results in separate goroutine
+	var resultsWg sync.WaitGroup
+	resultsWg.Add(1)
+	go func() {
+		defer resultsWg.Done()
+		for result := range resultsChan {
+			if err := resultWriter.WriteResult(result); err != nil {
+				s.logger.Printf("Error writing result: %v", err)
+			}
+		}
+	}()
+
+	// Process arguments
+	if err := s.processArgs(args, targetChan); err != nil {
+		return err
+	}
+
+	// Close channels and wait for completion
+	close(targetChan)
+	scanWg.Wait()
+	close(resultsChan)
+	resultsWg.Wait()
+
+	return nil
 }
 
 func main() {
@@ -339,22 +477,20 @@ func main() {
 	flag.DurationVar(&config.Timeout, "timeout", 2*time.Second, "Timeout for each scan")
 	flag.IntVar(&config.MaxConcurrency, "max-concurrent", runtime.NumCPU()*2, "Maximum concurrent scans")
 	flag.StringVar(&config.OutputFile, "output", "", "Output JSON file path")
+	flag.IntVar(&config.BufferSize, "buffer", 4*1024*1024, "Buffer size for file reading (bytes)")
 	flag.Parse()
 
 	if flag.NArg() == 0 {
 		fmt.Println("Usage: program [options] <target1> [target2] ...")
+		fmt.Println("Targets can be IP addresses, domain names, CIDR notation, or files with IPs/domains")
 		fmt.Println("Options:")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	scanner := NewIPScanner(config)
-	targets, err := scanner.resolveTargets(flag.Args())
-	if err != nil {
-		log.Fatalf("Error resolving targets: %v", err)
-	}
 
-	if err := scanner.streamResults(targets); err != nil {
-		log.Fatalf("Error scanning targets: %v", err)
+	if err := scanner.Run(flag.Args()); err != nil {
+		log.Fatalf("Error: %v", err)
 	}
 }
