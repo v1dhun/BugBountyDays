@@ -3,7 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ========== CONFIG ==========
-REQUIRED_TOOLS=(file unzip tar otool)
+REQUIRED_TOOLS=(file unzip tar otool jq)
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 # ============================
