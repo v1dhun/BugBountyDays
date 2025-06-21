@@ -1,82 +1,67 @@
 #!/bin/bash
-
 set -euo pipefail
+IFS=$'\n\t'
 
-usage() {
-    echo "Usage: $0 <path_to_ipa>"
+# ========== CONFIG ==========
+REQUIRED_TOOLS=(file unzip tar otool)
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+# ============================
+
+json() {
+    jq -n --arg key "$1" --arg val "$2" '{$key: $val}'
+}
+
+error_exit() {
+    jq -n --arg error "$1" '{"error": $error}'
     exit 1
 }
 
-for cmd in otool unzip; do
-    if ! command -v "$cmd" &> /dev/null; then
-        echo "Error: $cmd not found. Please install it."
-        exit 1
+check_required_tools() {
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            error_exit "Missing required tool: $tool"
+        fi
+    done
+}
+
+# ========== MAIN ==========
+main() {
+    [[ $# -ne 1 ]] && error_exit "Usage: $0 <path_to_ipa>"
+
+    IPA_FILE="$1"
+    [[ ! -f "$IPA_FILE" ]] && error_exit "IPA file not found: $IPA_FILE"
+
+    FILE_TYPE=$(file -b "$IPA_FILE")
+
+    if echo "$FILE_TYPE" | grep -iq "zip archive"; then
+        unzip -q "$IPA_FILE" -d "$TMP_DIR" || error_exit "Failed to unzip IPA"
+    elif echo "$FILE_TYPE" | grep -iq "gzip compressed"; then
+        tar -xzf "$IPA_FILE" -C "$TMP_DIR" || error_exit "Failed to extract gzip IPA"
+    else
+        error_exit "Unsupported IPA format: $FILE_TYPE"
     fi
-done
 
-if [[ $# -ne 1 ]]; then
-    usage
-fi
+    APP_DIR=$(find "$TMP_DIR/Payload" -type d -name "*.app" | head -n1)
+    [[ -z "$APP_DIR" ]] && error_exit "No .app found in Payload"
 
-IPA_FILE="$1"
+    BINARY_NAME=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP_DIR/Info.plist" 2>/dev/null || basename "$APP_DIR")
+    BINARY_PATH="$APP_DIR/$BINARY_NAME"
 
-# Check if file exists and is a valid IPA
-if [[ ! -f "$IPA_FILE" || "${IPA_FILE##*.}" != "ipa" ]]; then
-    echo "Error: Invalid or missing IPA file - $IPA_FILE"
-    exit 1
-fi
+    [[ ! -f "$BINARY_PATH" ]] && error_exit "Binary not found: $BINARY_PATH"
 
-# Temporary directory for extraction
-TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
+    OT_OUTPUT=$(otool -l "$BINARY_PATH" 2>/dev/null) || error_exit "otool failed on binary"
 
-echo "Extracting IPA to temporary directory..."
-FILE_TYPE=$(file "$IPA_FILE")
-if echo "$FILE_TYPE" | grep -q "Zip archive data"; then
-    echo "Detected .ipa as valid .zip archive"
-    unzip -q "$IPA_FILE" -d "$TEMP_DIR" || fail "Failed to unzip IPA"
-elif echo "$FILE_TYPE" | grep -q "gzip compressed data"; then
-    echo "Detected .ipa as gzip-compressed (tar.gz)"
-    tar -xzf "$IPA_FILE" -C "$TEMP_DIR" || fail "Failed to extract gzip archive"
-else
-    fail "Unsupported IPA format: $FILE_TYPE"
-fi
+    CRYPTID=$(echo "$OT_OUTPUT" | awk '/LC_ENCRYPTION_INFO/,/cryptid/ { if ($1 == "cryptid") print $2; }')
 
-# Find the app binary
-APP_PATH=$(find "$TEMP_DIR/Payload" -type d -name "*.app" | head -n 1)
-if [[ -z "$APP_PATH" ]]; then
-    echo "Error: Unable to find .app directory in IPA."
-    exit 1
-fi
+    [[ -z "$CRYPTID" ]] && error_exit "Could not extract cryptid"
 
-BINARY_NAME=$(basename "$APP_PATH" .app)
-BINARY_PATH="$APP_PATH/$BINARY_NAME"
+    case "$CRYPTID" in
+        1) jq -n '{"encrypted": true, "cryptid": 1}' ;;
+        0) jq -n '{"encrypted": false, "cryptid": 0}' ;;
+        *) error_exit "Unknown cryptid value: $CRYPTID" ;;
+    esac
+}
 
-if [[ ! -f "$BINARY_PATH" ]]; then
-    echo "Error: App binary not found at $BINARY_PATH."
-    exit 1
-fi
-
-echo "Performing encryption status check using otool..."
-if ! OT_OUTPUT=$(otool -l "$BINARY_PATH" 2>/dev/null); then
-    echo "Error: Failed to analyze binary using otool."
-    exit 1
-fi
-
-# Extract the cryptid value
-CRYPTID=$(echo "$OT_OUTPUT" | awk '/LC_ENCRYPTION_INFO/,/cryptid/' | grep -m1 cryptid | awk '{print $2}')
-
-if [[ -z "$CRYPTID" ]]; then
-    echo "Error: Unable to determine encryption status. cryptid not found."
-    exit 1
-fi
-
-# Print encryption status
-if [[ "$CRYPTID" == "1" ]]; then
-    echo "✅ Result: The IPA is encrypted (cryptid = 1)."
-elif [[ "$CRYPTID" == "0" ]]; then
-    echo "✅ Result: The IPA is not encrypted (cryptid = 0)."
-else
-    echo "Error: Unexpected cryptid value: $CRYPTID"
-    exit 1
-fi
+check_required_tools
+main "$@"
