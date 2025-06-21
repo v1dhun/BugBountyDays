@@ -31,9 +31,15 @@ TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
 echo "Extracting IPA to temporary directory..."
-if ! unzip -q "$IPA_FILE" -d "$TEMP_DIR"; then
-    echo "Error: Failed to extract IPA."
-    exit 1
+FILE_TYPE=$(file "$IPA_FILE")
+if echo "$FILE_TYPE" | grep -q "Zip archive data"; then
+    info "Detected .ipa as valid .zip archive"
+    unzip -q "$IPA_FILE" -d "$TEMP_DIR" || fail "Failed to unzip IPA"
+elif echo "$FILE_TYPE" | grep -q "gzip compressed data"; then
+    info "Detected .ipa as gzip-compressed (tar.gz)"
+    tar -xzf "$IPA_FILE" -C "$TEMP_DIR" || fail "Failed to extract gzip archive"
+else
+    fail "Unsupported IPA format: $FILE_TYPE"
 fi
 
 # Find the app binary
