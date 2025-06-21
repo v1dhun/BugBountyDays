@@ -1,3 +1,6 @@
+# This script is intended for educational, security research purposes on apps 
+# you own or have permission to analyze. The author does not support or condone piracy.
+
 #!/usr/bin/env python3
 import os
 import sys
